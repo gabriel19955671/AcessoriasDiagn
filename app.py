@@ -1,6 +1,7 @@
-# app.py — Acessórias (v4)
+# app.py — Acessórias (v4.1)
 # Fluxo guiado + Auto-detectar + leitura robusta + filtros globais (sidebar)
 # Técnico/Legal (toggle), metas/semáforos, dashboards enxutos, Processos
+# Correção: bloco "Riscos & Alertas" robusto + fix em up_obrig
 
 import difflib
 from datetime import date, datetime
@@ -13,7 +14,7 @@ import streamlit as st
 # Config do App
 # ==============================
 st.set_page_config(page_title="Acessórias — Diagnóstico", layout="wide")
-st.title("📊 Acessórias — Diagnóstico (v4)")
+st.title("📊 Acessórias — Diagnóstico (v4.1)")
 st.caption("Fluxo: ① Dados & Mapeamento → ② Ajuste Filtros (sidebar) → ③ Dashboards → ④ Export/Drill-down.")
 
 # ==============================
@@ -383,8 +384,8 @@ with tabs[9]:
 
     # OBRIGAÇÕES (referência)
     if up_obrig:
-        name = up_obr.name.lower()
-        raw = try_read_excel(up_obr) if name.endswith(('.xls', '.xlsx', '.xlsm', '.xlsb')) else read_any_csv(up_obr)
+        name = up_obrig.name.lower()
+        raw = try_read_excel(up_obrig) if name.endswith(('.xls', '.xlsx', '.xlsm', '.xlsb')) else read_any_csv(up_obrig)
         raw = normalize_headers(raw)
         required = ["obrigacao","departamento"]
         optional = ["mini","empresa","responsavel","periodicidade","prazo_mensal","alerta_dias","observacao"]
@@ -602,40 +603,81 @@ if not require_entregas(tabs[6]):
                 st.info("Necessário **data_entrega** para medir carga recente.")
 
 # ==============================
-# 🚨 Riscos & Alertas (regras simples)
+# 🚨 Riscos & Alertas (regras robustas)
 # ==============================
 if not require_entregas(tabs[7]):
     with tabs[7]:
-        dfg = apply_global_filters(dfe); b = get_basis_columns(basis)
-        st.markdown("**Regras**: % no prazo < meta, atraso médio > 5 dias, sem prazo técnico, sem responsável.")
-        riscos = []
+        dfg = apply_global_filters(dfe)
+        b = get_basis_columns(basis)
 
-        # por cliente
-        g_cli = dfg.groupby("empresa").agg(
-            pct=(b["no_prazo"], "mean"),
-            atraso=(b["atraso_dias"], "mean"),
-            sem_resp=("responsavel_entrega", lambda s: s.isna().mean() if len(s)>0 else np.nan),
-            sem_pt=("prazo_tecnico", lambda s: pd.to_datetime(s, errors="coerce").isna().mean() if len(s)>0 else np.nan)
-        ).reset_index()
-        g_cli["pct"] = g_cli["pct"]*100
-        if not g_cli.empty:
-            r1 = g_cli[(g_cli["pct"] < st.session_state.get("meta_ok", 95.0)) | (g_cli["atraso"] > 5) | (g_cli["sem_pt"] > 0.05) | (g_cli["sem_resp"] > 0.05)]
-            r1["score_risco"] = (
-                (np.maximum(0, 95 - r1["pct"]))*0.5 +
-                (np.maximum(0, r1["atraso"] - 5))*5 +
-                (r1["sem_pt"]*100)*0.2 +
-                (r1["sem_resp"]*100)*0.3
-            ).round(1)
-            riscos = r1.sort_values("score_risco", ascending=False).rename(columns={
-                "empresa":"entidade","pct":f"{b['label']}", "atraso":"atraso_medio"
-            })
-
-        if isinstance(riscos, pd.DataFrame) and not riscos.empty:
-            st.dataframe(riscos[["entidade",f"{b['label']}","atraso_medio","sem_pt","sem_resp","score_risco"]])
-            st.plotly_chart(px.bar(riscos.head(10), x="entidade", y="score_risco", title="Top riscos (clientes)"),
-                            use_container_width=True)
+        if "empresa" not in dfg.columns:
+            st.info("Para analisar riscos por cliente, mapeie a coluna **empresa** em '🗂️ Dados & Mapeamento'.")
         else:
-            st.success("Nenhum risco relevante pelas regras atuais.")
+            # Colunas auxiliares sempre presentes (evita KeyError no agg)
+            dfg2 = dfg.copy()
+
+            dfg2["_no_prazo"] = (
+                dfg2[b["no_prazo"]].astype(float)
+                if b["no_prazo"] in dfg2.columns else np.nan
+            )
+            dfg2["_atraso"] = (
+                dfg2[b["atraso_dias"]].astype(float)
+                if b["atraso_dias"] in dfg2.columns else np.nan
+            )
+
+            if "responsavel_entrega" in dfg2.columns:
+                dfg2["_resp_nan"] = dfg2["responsavel_entrega"].isna().astype(float)
+            else:
+                dfg2["_resp_nan"] = np.nan  # não avalia se não houver coluna
+
+            if "prazo_tecnico" in dfg2.columns:
+                dfg2["_pt_nan"] = pd.to_datetime(dfg2["prazo_tecnico"], errors="coerce").isna().astype(float)
+            else:
+                dfg2["_pt_nan"] = np.nan  # não avalia se não houver coluna
+
+            g_cli = dfg2.groupby("empresa").agg(
+                pct=("_no_prazo", "mean"),
+                atraso=("_atraso", "mean"),
+                sem_resp=("_resp_nan", "mean"),
+                sem_pt=("_pt_nan", "mean")
+            ).reset_index()
+
+            g_cli["pct"] = (g_cli["pct"] * 100).round(2)
+
+            # Se a coluna inteira era NaN (não existia), zera para não punir
+            for c in ["sem_resp", "sem_pt"]:
+                if g_cli[c].isna().all():
+                    g_cli[c] = 0.0
+
+            g_cli["sem_resp"] = (g_cli["sem_resp"] * 100).round(1)
+            g_cli["sem_pt"]   = (g_cli["sem_pt"]   * 100).round(1)
+
+            # usa meta_ok da sidebar
+            _meta_ok = meta_ok
+            g_cli["score_risco"] = (
+                np.maximum(0, _meta_ok - g_cli["pct"]) * 0.5 +     # quanto abaixo da meta
+                np.maximum(0, g_cli["atraso"] - 5) * 5 +           # severidade > 5 dias
+                g_cli["sem_pt"] * 0.2 +                            # % sem prazo técnico
+                g_cli["sem_resp"] * 0.3                            # % sem responsável
+            ).round(1)
+
+            riscos = g_cli.sort_values("score_risco", ascending=False)
+
+            st.markdown("**Ranking de Riscos por Cliente**")
+            st.dataframe(
+                riscos[["empresa","pct","atraso","sem_pt","sem_resp","score_risco"]]
+                    .rename(columns={"pct": b["label"], "atraso": "atraso_medio"})
+            )
+
+            if not riscos.empty:
+                st.plotly_chart(
+                    px.bar(riscos.head(10), x="empresa", y="score_risco", title="Top 10 riscos (clientes)"),
+                    use_container_width=True
+                )
+            else:
+                st.success("Nenhum risco relevante pelas regras atuais.")
+
+        st.caption("Regras: (i) abaixo da meta de % no prazo, (ii) atraso médio > 5 dias, (iii) sem prazo técnico, (iv) sem responsável.")
 
 # ==============================
 # 🔄 Processos (funil/gargalo/lead time)
