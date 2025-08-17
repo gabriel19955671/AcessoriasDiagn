@@ -1,30 +1,25 @@
-# app.py — Acessórias — Dashboard Claro (v2)
-# - Auto-detectar mapeamento
-# - Leitura robusta Excel/CSV
-# - Base Técnico/Legal (toggle)
-# - Metas e semáforos
-# - Dashboards: Clientes, Departamentos, Colaboradores, Linha do Tempo
-# - Drill-down + export CSV
+# app.py — Acessórias (v4)
+# Fluxo guiado + Auto-detectar + leitura robusta + filtros globais (sidebar)
+# Técnico/Legal (toggle), metas/semáforos, dashboards enxutos, Processos
 
 import difflib
-from datetime import date
+from datetime import date, datetime
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 # ==============================
-# Configuração do app
+# Config do App
 # ==============================
-st.set_page_config(page_title="Acessórias — Dashboard Claro (v2)", layout="wide")
-st.title("📊 Acessórias — Dashboard Claro (v2)")
-st.caption("Dashboards por Cliente, Departamento e Colaborador com metas, semáforos e drill-down. O botão **Auto-detectar** sugere o mapeamento automaticamente — você pode ajustar manualmente.")
+st.set_page_config(page_title="Acessórias — Diagnóstico", layout="wide")
+st.title("📊 Acessórias — Diagnóstico (v4)")
+st.caption("Fluxo: ① Dados & Mapeamento → ② Ajuste Filtros (sidebar) → ③ Dashboards → ④ Export/Drill-down.")
 
 # ==============================
-# Leitura robusta de arquivos
+# Leitura robusta (CSV/Excel)
 # ==============================
 def read_any_csv(uploaded_file) -> pd.DataFrame:
-    """Lê CSV tentando múltiplas codificações e separadores."""
     encodings = ["utf-8", "utf-8-sig", "latin1", "cp1252", "iso-8859-1", "utf-16", "utf-16le", "utf-16be"]
     seps = [None, ";", ",", "|", "\t"]
     last_err = None
@@ -36,18 +31,14 @@ def read_any_csv(uploaded_file) -> pd.DataFrame:
             except Exception as e:
                 last_err = e
                 continue
-    # Último recurso: ignora linhas ruins
     try:
         uploaded_file.seek(0)
         return pd.read_csv(uploaded_file, sep=None, engine="python", encoding="latin1", dtype=str, on_bad_lines="skip")
-    except Exception as e2:
+    except Exception:
         st.error(f"Não consegui abrir o CSV. Último erro: {last_err}")
         raise
 
 def try_read_excel(uploaded_file) -> pd.DataFrame:
-    """Lê Excel com detecção de formato + fallbacks.
-       .xlsx/.xlsm -> openpyxl | .xlsb -> pyxlsb | .xls -> xlrd (fallback openpyxl) | fallback: CSV
-    """
     name = (getattr(uploaded_file, "name", "") or "").lower()
 
     def _try(fn, *a, **k):
@@ -60,29 +51,23 @@ def try_read_excel(uploaded_file) -> pd.DataFrame:
     if name.endswith((".xlsx", ".xlsm")):
         df = _try(pd.read_excel, uploaded_file, engine="openpyxl", dtype=str)
         if df is not None: return df
-
     if name.endswith(".xlsb"):
         df = _try(pd.read_excel, uploaded_file, engine="pyxlsb", dtype=str)
         if df is not None: return df
-
     if name.endswith(".xls"):
         df = _try(pd.read_excel, uploaded_file, engine="xlrd", dtype=str)
         if df is not None: return df
-        # muitos ".xls" são .xlsx renomeados
         df = _try(pd.read_excel, uploaded_file, engine="openpyxl", dtype=str)
         if df is not None: return df
-
-    # Heurística (extensão errada)
     for eng in ("openpyxl", "pyxlsb", "xlrd"):
         df = _try(pd.read_excel, uploaded_file, engine=eng, dtype=str)
         if df is not None: return df
 
-    # CSV renomeado
     uploaded_file.seek(0)
     return read_any_csv(uploaded_file)
 
 # ==============================
-# Helpers gerais
+# Helpers de transformação
 # ==============================
 def normalize_headers(df):
     df.columns = [str(c).strip().lower() for c in df.columns]
@@ -129,14 +114,14 @@ def guess_mapping(df_cols, targets):
 
 def mapping_wizard(df, title, required, optional, key):
     st.subheader(f"🧭 {title} — Mapeamento de Colunas")
-    st.caption("**Auto-detectar** procura no nomes das colunas aquilo que você precisa mapear. Depois você pode ajustar manualmente.")
+    st.caption("Use **Auto-detectar** e ajuste manualmente onde precisar. Campos obrigatórios e opcionais abaixo.")
     st.dataframe(df.head(5))
 
     cols = list(df.columns)
     req_guess = guess_mapping(cols, required)
     opt_guess = guess_mapping(cols, optional)
 
-    ctop1, ctop2 = st.columns([1,1])
+    ctop1, ctop2 = st.columns(2)
     with ctop1:
         if st.button("🔍 Auto-detectar", key=f"auto_{key}"):
             st.session_state[f"map_req_{key}"] = req_guess
@@ -181,42 +166,42 @@ def mapping_wizard(df, title, required, optional, key):
     return merged
 
 # ==============================
-# Métricas de Entregas (técnico e legal)
+# Enriquecimento de Entregas (à prova de coluna ausente)
 # ==============================
 def enrich_entregas(df_ent: pd.DataFrame) -> pd.DataFrame:
-    if df_ent is None or df_ent.empty: return df_ent
-    df = df_ent.copy()
-    df = to_datetime_cols(df, ["data_vencimento","data_entrega","competencia","prazo_tecnico","data_legal"])
+    if df_ent is None: return df_ent
+    if df_ent.empty: return df_ent.copy()
+
+    df = normalize_headers(df_ent.copy())
+
+    # séries seguras
+    de = pd.to_datetime(s_get(df, "data_entrega", default=pd.NaT), errors="coerce", dayfirst=True)
+    pt = pd.to_datetime(s_get(df, "prazo_tecnico", default=pd.NaT), errors="coerce", dayfirst=True)
+    dl = pd.to_datetime(s_get(df, "data_legal", default=pd.NaT), errors="coerce", dayfirst=True)
+    dv = pd.to_datetime(s_get(df, "data_vencimento", default=pd.NaT), errors="coerce", dayfirst=True)
+    cp = pd.to_datetime(s_get(df, "competencia", default=pd.NaT), errors="coerce", dayfirst=True)
+
+    df["data_entrega"] = de
+    df["prazo_tecnico"] = pt
+    df["data_legal"] = dl
+    df["data_vencimento"] = dv
+    df["competencia"] = cp
+
     if "status" in df.columns:
         df["status"] = df["status"].map(norm_status).fillna(df["status"])
+
     # Técnico
-    df["no_prazo_tecnico"] = np.where(
-        df.get("data_entrega").notna() & df.get("prazo_tecnico").notna() & (df["data_entrega"] <= df["prazo_tecnico"]),
-        True,
-        np.where(df.get("data_entrega").notna() & df.get("prazo_tecnico").notna(), False, np.nan)
-    )
-    df["antecipada_tecnico"] = np.where(
-        df.get("data_entrega").notna() & df.get("prazo_tecnico").notna() & (df["data_entrega"] < df["prazo_tecnico"]),
-        True, False
-    )
-    df["atraso_tecnico_dias"] = np.where(
-        df.get("data_entrega").notna() & df.get("prazo_tecnico").notna(),
-        s_dt_days(df["data_entrega"] - df["prazo_tecnico"]).clip(lower=0), np.nan
-    )
+    has_both_t = de.notna() & pt.notna()
+    df["no_prazo_tecnico"]    = np.where(has_both_t & (de <= pt), True, np.where(has_both_t, False, np.nan))
+    df["antecipada_tecnico"]  = has_both_t & (de < pt)
+    df["atraso_tecnico_dias"] = np.where(has_both_t, (de - pt).dt.days.clip(lower=0), np.nan)
+
     # Legal
-    df["no_prazo_legal"] = np.where(
-        df.get("data_entrega").notna() & df.get("data_legal").notna() & (df["data_entrega"] <= df["data_legal"]),
-        True,
-        np.where(df.get("data_entrega").notna() & df.get("data_legal").notna(), False, np.nan)
-    )
-    df["antecipada_legal"] = np.where(
-        df.get("data_entrega").notna() & df.get("data_legal").notna() & (df["data_entrega"] < df["data_legal"]),
-        True, False
-    )
-    df["atraso_legal_dias"] = np.where(
-        df.get("data_entrega").notna() & df.get("data_legal").notna(),
-        s_dt_days(df["data_entrega"] - df["data_legal"]).clip(lower=0), np.nan
-    )
+    has_both_l = de.notna() & dl.notna()
+    df["no_prazo_legal"]      = np.where(has_both_l & (de <= dl), True, np.where(has_both_l, False, np.nan))
+    df["antecipada_legal"]    = has_both_l & (de < dl)
+    df["atraso_legal_dias"]   = np.where(has_both_l, (de - dl).dt.days.clip(lower=0), np.nan)
+
     return df
 
 def get_basis_columns(basis: str):
@@ -226,27 +211,85 @@ def get_basis_columns(basis: str):
     else:
         return dict(no_prazo="no_prazo_legal", atraso_dias="atraso_legal_dias", antecipada="antecipada_legal", label="% no prazo (legal)")
 
-def global_filters(df: pd.DataFrame, who="global"):
+# ==============================
+# Enriquecimento de Processos
+# ==============================
+def enrich_procs(dfp: pd.DataFrame) -> pd.DataFrame:
+    if dfp is None: return dfp
+    if dfp.empty: return dfp.copy()
+    df = normalize_headers(dfp.copy())
+    # datas
+    ab = pd.to_datetime(s_get(df, "abertura", default=pd.NaT), errors="coerce", dayfirst=True)
+    co = pd.to_datetime(s_get(df, "conclusao", default=pd.NaT), errors="coerce", dayfirst=True)
+    pp = pd.to_datetime(s_get(df, "proximo_prazo", default=pd.NaT), errors="coerce", dayfirst=True)
+    df["abertura"] = ab
+    df["conclusao"] = co
+    df["proximo_prazo"] = pp
+    # lead time (concluídos) e aging (abertos)
+    today = pd.to_datetime(datetime.now().date())
+    df["lead_time_dias"] = np.where(co.notna() & ab.notna(), (co - ab).dt.days, np.nan)
+    df["aging_dias"] = np.where(co.isna() & ab.notna(), (today - ab).dt.days, np.nan)
+    # status simples
+    if "status" not in df.columns:
+        df["status"] = np.where(df["conclusao"].notna(), "Concluído", "Em andamento")
+    return df
+
+# ==============================
+# Estado inicial
+# ==============================
+for k in ["dfe","dfs","dfo","dfr","dfp"]:
+    if k not in st.session_state: st.session_state[k] = None
+
+# ==============================
+# Sidebar — Fluxo + Config + Filtros
+# ==============================
+with st.sidebar:
+    st.header("🧭 Fluxo")
+    st.markdown("1) **Dados & Mapeamento**\n2) **Ajuste Filtros**\n3) **Dashboards**")
+    st.divider()
+
+    st.header("⚙️ Configurações")
+    basis = st.radio("Base dos KPIs", ["Técnico", "Legal"], index=0, horizontal=True)
+    meta_ok = st.number_input("Meta OK (≥ %)", min_value=50.0, max_value=100.0, value=95.0, step=0.5)
+    meta_atencao = st.number_input("Meta Atenção (≥ %)", min_value=0.0, max_value=100.0, value=85.0, step=0.5)
+    st.caption("Semáforo: 🟢 ≥ OK | 🟡 ≥ Atenção | 🔴 < Atenção")
+    basis_cols = get_basis_columns(basis)
+    st.divider()
+
+    # Filtros globais (aplicados às Entregas)
+    st.header("🎛️ Filtros Globais (Entregas)")
+    dfe_tmp = st.session_state["dfe"]
+    if isinstance(dfe_tmp, pd.DataFrame) and not dfe_tmp.empty:
+        dfc = dfe_tmp
+        date_candidates = [c for c in dfc.columns if (pd.api.types.is_datetime64_any_dtype(dfc[c]) or any(k in c for k in ["data","venc","entrega","competencia","legal","tecnico","técnico"]))]
+        seen=set(); date_candidates=[x for x in date_candidates if not (x in seen or seen.add(x))]
+        dcol = st.selectbox("Coluna de data", ["<sem filtro>"] + date_candidates, index=1 if date_candidates else 0, key="dcol_global") if date_candidates else "<sem filtro>"
+        di = st.date_input("De (data)", value=None, key="di_global") if dcol and dcol != "<sem filtro>" else None
+        dfim = st.date_input("Até (data)", value=None, key="df_global") if dcol and dcol != "<sem filtro>" else None
+        emp_sel = st.multiselect("Clientes", sorted(dfc.get("empresa", pd.Series(dtype=str)).dropna().unique().tolist())) if "empresa" in dfc.columns else []
+        dep_sel = st.multiselect("Departamentos", sorted(dfc.get("departamento", pd.Series(dtype=str)).dropna().unique().tolist())) if "departamento" in dfc.columns else []
+        colab_sel = st.multiselect("Colaboradores", sorted(dfc.get("responsavel_entrega", pd.Series(dtype=str)).dropna().unique().tolist())) if "responsavel_entrega" in dfc.columns else []
+
+        st.session_state["flt_dcol"] = dcol
+        st.session_state["flt_di"] = di
+        st.session_state["flt_df"] = dfim
+        st.session_state["flt_emp"] = emp_sel
+        st.session_state["flt_dep"] = dep_sel
+        st.session_state["flt_col"] = colab_sel
+    else:
+        st.info("Carregue **Entregas** para habilitar filtros.")
+
+def apply_global_filters(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty: return df
-    date_candidates = [c for c in df.columns if (pd.api.types.is_datetime64_any_dtype(df[c]) or any(k in c for k in ["data","venc","entrega","competencia","legal","tecnico","técnico"]))]
-    seen=set(); date_candidates=[x for x in date_candidates if not (x in seen or seen.add(x))]
-    with st.expander("🎛️ Filtros Globais", expanded=True):
-        col1,col2,col3 = st.columns(3)
-        with col1:
-            dcol = st.selectbox("Coluna de data para filtrar", ["<sem filtro>"] + date_candidates, index=1 if date_candidates else 0, key=f"dcol_{who}") if date_candidates else None
-        with col2:
-            di = st.date_input("De (data)", value=None, key=f"di_{who}") if dcol else None
-        with col3:
-            dfim = st.date_input("Até (data)", value=None, key=f"df_{who}") if dcol else None
-        col4,col5,col6 = st.columns(3)
-        with col4:
-            emp_sel = st.multiselect("Clientes (empresa)", sorted(df.get("empresa", pd.Series(dtype=str)).dropna().unique().tolist())) if "empresa" in df.columns else []
-        with col5:
-            dep_sel = st.multiselect("Departamentos", sorted(df.get("departamento", pd.Series(dtype=str)).dropna().unique().tolist())) if "departamento" in df.columns else []
-        with col6:
-            colab_sel = st.multiselect("Colaboradores", sorted(df.get("responsavel_entrega", pd.Series(dtype=str)).dropna().unique().tolist())) if "responsavel_entrega" in df.columns else []
+    dcol = st.session_state.get("flt_dcol", "<sem filtro>")
+    di = st.session_state.get("flt_di", None)
+    dfim = st.session_state.get("flt_df", None)
+    emp_sel = st.session_state.get("flt_emp", [])
+    dep_sel = st.session_state.get("flt_dep", [])
+    colab_sel = st.session_state.get("flt_col", [])
+
     mask = pd.Series(True, index=df.index)
-    if dcol and dcol != "<sem filtro>":
+    if dcol and dcol != "<sem filtro>" and dcol in df.columns:
         dts = pd.to_datetime(df[dcol], errors="coerce")
         if di:   mask &= dts.dt.date >= di
         if dfim: mask &= dts.dt.date <= dfim
@@ -269,50 +312,41 @@ def ranking(df, group_col, metric, basis_cols, how="desc", top=10):
     else:
         return pd.DataFrame(columns=[group_col, "valor"])
     out = s.reset_index(name="valor").replace({np.inf: np.nan, -np.inf: np.nan})
-    out = out.dropna(subset=["valor"])
-    out = out.sort_values("valor", ascending=(how=="asc")).head(top)
+    out = out.dropna(subset=["valor"]).sort_values("valor", ascending=(how=="asc")).head(top)
     return out
-
-# ==============================
-# Sidebar — metas e base (técnico x legal)
-# ==============================
-with st.sidebar:
-    st.header("⚙️ Configurações")
-    basis = st.radio("Base dos KPIs", ["Técnico", "Legal"], index=0, horizontal=True)
-    meta_ok = st.number_input("Meta OK (≥ %)", min_value=50.0, max_value=100.0, value=95.0, step=0.5)
-    meta_atencao = st.number_input("Meta Atenção (≥ %)", min_value=0.0, max_value=100.0, value=85.0, step=0.5)
-    st.caption("Semáforo: **Verde** ≥ OK | **Amarelo** ≥ Atenção | **Vermelho** < Atenção")
-basis_cols = get_basis_columns(basis)
-
-def badge_pct(v):
-    if pd.isna(v): return "—"
-    if v >= meta_ok: return f"🟢 {v:,.1f}%"
-    if v >= meta_atencao: return f"🟡 {v:,.1f}%"
-    return f"🔴 {v:,.1f}%"
 
 # ==============================
 # Abas
 # ==============================
-tabs = st.tabs(["🏠 Resumo", "👥 Clientes", "🏢 Departamentos", "🧑‍💼 Colaboradores", "📆 Linha do Tempo", "🗂️ Dados (Upload & Mapeamento)"])
+tabs = st.tabs([
+    "🏁 Resumo Executivo",
+    "👥 Clientes",
+    "🏢 Departamentos",
+    "🧑‍💼 Colaboradores",
+    "📆 Linha do Tempo",
+    "📦 SLA & Backlog",
+    "🧰 Capacidade & Carga",
+    "🚨 Riscos & Alertas",
+    "🔄 Processos",
+    "🗂️ Dados & Mapeamento",
+    "🧪 Qualidade & Dicionário"
+])
 
 # ==============================
-# Aba: Dados (Upload & Mapeamento)
+# Aba: Dados & Mapeamento (final da lista para orientar o fluxo)
 # ==============================
-with tabs[5]:
-    st.subheader("🗂️ Upload & Mapeamento")
-    st.caption("Carregue os arquivos e mapeie as colunas. **Auto-detectar** sugere o mapeamento; ajuste se necessário.")
+with tabs[9]:
+    st.subheader("🗂️ 1) Carregue e mapeie os dados")
     colA, colB = st.columns(2)
     with colA:
         up_entregas = st.file_uploader("Gestão de Entregas (CSV)", type=["csv"], key="up_ent")
         up_solic    = st.file_uploader("Solicitações (XLS/XLSX/XLSM/XLSB/CSV)", type=["xls","xlsx","xlsm","xlsb","csv"], key="up_sol")
+        up_procs    = st.file_uploader("Gestão de Processos (XLS/XLSX/XLSM/XLSB/CSV)", type=["xls","xlsx","xlsm","xlsb","csv"], key="up_procs")
     with colB:
         up_obrig    = st.file_uploader("Lista de Obrigações (XLS/XLSX/XLSM/XLSB/CSV)", type=["xls","xlsx","xlsm","xlsb","csv"], key="up_obr")
         up_resp     = st.file_uploader("Responsáveis & Departamentos (XLS/XLSX/XLSM/XLSB/CSV)", type=["xls","xlsx","xlsm","xlsb","csv"], key="up_resp")
 
-    for key in ["dfe","dfs","dfo","dfr"]:
-        if key not in st.session_state: st.session_state[key] = None
-
-    # Entregas
+    # ENTREGAS
     if up_entregas:
         raw = read_any_csv(up_entregas); raw = normalize_headers(raw)
         required = ["empresa","obrigacao","data_vencimento","status"]
@@ -322,7 +356,7 @@ with tabs[5]:
         st.session_state["dfe"] = enrich_entregas(dfe)
         st.success("Entregas carregadas e enriquecidas.")
 
-    # Solicitações
+    # SOLICITAÇÕES
     if up_solic:
         name = up_solic.name.lower()
         raw = try_read_excel(up_solic) if name.endswith(('.xls', '.xlsx', '.xlsm', '.xlsb')) else read_any_csv(up_solic)
@@ -335,19 +369,31 @@ with tabs[5]:
         st.session_state["dfs"] = dfs
         st.success("Solicitações carregadas.")
 
-    # Obrigações (opcional / referência)
+    # PROCESSOS
+    if up_procs:
+        name = up_procs.name.lower()
+        raw = try_read_excel(up_procs) if name.endswith(('.xls', '.xlsx', '.xlsm', '.xlsb')) else read_any_csv(up_procs)
+        raw = normalize_headers(raw)
+        required = ["id","processo","empresa","status"]
+        optional = ["etapa_atual","responsavel","abertura","conclusao","proximo_prazo","departamento"]
+        m = mapping_wizard(raw, "Gestão de Processos", required, optional, "proc")
+        dfp = raw.rename(columns=m)
+        st.session_state["dfp"] = enrich_procs(dfp)
+        st.success("Processos carregados e enriquecidos.")
+
+    # OBRIGAÇÕES (referência)
     if up_obrig:
-        name = up_obrig.name.lower()
-        raw = try_read_excel(up_obrig) if name.endswith(('.xls', '.xlsx', '.xlsm', '.xlsb')) else read_any_csv(up_obrig)
+        name = up_obr.name.lower()
+        raw = try_read_excel(up_obr) if name.endswith(('.xls', '.xlsx', '.xlsm', '.xlsb')) else read_any_csv(up_obr)
         raw = normalize_headers(raw)
         required = ["obrigacao","departamento"]
         optional = ["mini","empresa","responsavel","periodicidade","prazo_mensal","alerta_dias","observacao"]
         m = mapping_wizard(raw, "Lista de Obrigações", required, optional, "obr")
         dfo = raw.rename(columns=m)
         st.session_state["dfo"] = dfo
-        st.info("Lista de Obrigações carregada. (Referência)")
+        st.info("Lista de Obrigações carregada (referência).")
 
-    # Responsáveis (opcional / referência)
+    # RESPONSÁVEIS (referência)
     if up_resp:
         name = up_resp.name.lower()
         raw = try_read_excel(up_resp) if name.endswith(('.xls', '.xlsx', '.xlsm', '.xlsb')) else read_any_csv(up_resp)
@@ -357,185 +403,131 @@ with tabs[5]:
         m = mapping_wizard(raw, "Responsáveis & Departamentos", required, optional, "resp")
         dfr = raw.rename(columns=m)
         st.session_state["dfr"] = dfr
-        st.info("Responsáveis carregados.")
+        st.info("Responsáveis carregados (referência).")
 
 # ==============================
 # Dados em sessão
 # ==============================
-dfe = st.session_state.get("dfe")  # entregas enriquecidas
+dfe = st.session_state.get("dfe")  # entregas (enriquecidas)
 dfs = st.session_state.get("dfs")  # solicitações
+dfp = st.session_state.get("dfp")  # processos (enriquecidos)
+
+def require_entregas(tab_container):
+    if dfe is None or (isinstance(dfe, pd.DataFrame) and dfe.empty):
+        with tab_container:
+            st.info("Carregue **Entregas** em '🗂️ Dados & Mapeamento' para habilitar.")
+        return True
+    return False
 
 # ==============================
-# Aba: Resumo
+# 🏁 Resumo Executivo
 # ==============================
 with tabs[0]:
-    st.subheader("🔎 Resumo Executivo")
+    st.subheader("📌 KPIs Gerais")
     if dfe is None or dfe.empty:
-        st.info("Carregue **Entregas** em '🗂️ Dados' para ver o resumo.")
+        st.info("Carregue **Entregas** para ver os KPIs.")
     else:
-        dfg = global_filters(dfe, who="home")
+        dfg = apply_global_filters(dfe)
+        b = get_basis_columns(basis)
+        pct_prazo = float((dfg[b["no_prazo"]].mean()*100)) if b["no_prazo"] in dfg.columns else np.nan
+        atraso_med = float(dfg[b["atraso_dias"]].mean()) if b["atraso_dias"] in dfg.columns else np.nan
+        antecip = int(dfg[b["antecipada"]].sum()) if b["antecipada"] in dfg.columns else 0
         total = len(dfg)
-        pct_prazo = float((dfg[get_basis_columns(basis)["no_prazo"]].mean()*100)) if get_basis_columns(basis)["no_prazo"] in dfg.columns else np.nan
-        pct_atraso = 100 - pct_prazo if not np.isnan(pct_prazo) else np.nan
-        antec = int(dfg[get_basis_columns(basis)["antecipada"]].sum()) if get_basis_columns(basis)["antecipada"] in dfg.columns else 0
-        soli_total = len(dfs) if isinstance(dfs, pd.DataFrame) else 0
         c1,c2,c3,c4 = st.columns(4)
-        c1.metric(get_basis_columns(basis)["label"], f"{pct_prazo:,.1f}%".replace(",","."))  # valor numérico limpo
-        c2.metric("% atraso (base)", f"{pct_atraso:,.1f}%".replace(",","."))
-        c3.metric("Entregas antecipadas (base)", f"{antec:,}".replace(",","."))
-        c4.metric("Solicitações (total)", f"{soli_total:,}".replace(",","."))
+        c1.metric(b["label"], f"{pct_prazo:,.1f}%".replace(",","."))     # cumprimento
+        c2.metric("Atraso médio (dias)", f"{atraso_med:,.1f}".replace(",","."))  # severidade
+        c3.metric("Entregas antecipadas", f"{antecip:,}".replace(",","."))      # eficiência
+        c4.metric("Tarefas (base)", f"{total:,}".replace(",","."))
 
-        st.markdown(f"#### 🏆 Top 10 Departamentos — {get_basis_columns(basis)['label']}")
-        rdep = ranking(dfg, "departamento", "pct_no_prazo", get_basis_columns(basis), how="desc", top=10) if "departamento" in dfg.columns else pd.DataFrame()
-        st.dataframe(rdep)
-        if not rdep.empty:
-            st.plotly_chart(px.bar(rdep, x="departamento", y="valor", title=get_basis_columns(basis)["label"]+" — Departamentos"), use_container_width=True)
-            escolha = st.selectbox("🔎 Ver detalhes do departamento", ["<selecione>"] + rdep["departamento"].tolist(), key="det_dep_home")
-            if escolha and escolha != "<selecione>":
-                det = dfg[dfg["departamento"] == escolha].copy()
-                st.dataframe(det)
-                st.download_button("⬇️ Baixar detalhes (CSV)", det.to_csv(index=False).encode("utf-8"), f"detalhes_{escolha}_departamento.csv", "text/csv")
-
-# ==============================
-# Aba: Clientes
-# ==============================
-with tabs[1]:
-    st.subheader("👥 Clientes — Rankings rápidos")
-    if dfe is None or dfe.empty:
-        st.info("Carregue **Entregas** em '🗂️ Dados'.")
+    st.subheader("🧩 Processos (se fornecidos)")
+    if dfp is None or dfp.empty:
+        st.info("Carregue **Gestão de Processos** para ver estes KPIs.")
     else:
-        dfg = global_filters(dfe, who="cli")
+        dfpp = dfp.copy()
+        lead_med = float(dfpp["lead_time_dias"].mean()) if "lead_time_dias" in dfpp.columns else np.nan
+        aging_med = float(dfpp["aging_dias"].mean()) if "aging_dias" in dfpp.columns else np.nan
+        em_andamento = int((dfpp["status"]=="Em andamento").sum()) if "status" in dfpp.columns else 0
+        concl = int((dfpp["status"]=="Concluído").sum()) if "status" in dfpp.columns else 0
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("Lead time médio (dias)", f"{lead_med:,.1f}".replace(",","."))    # tempo processo
+        c2.metric("Aging médio (dias)", f"{aging_med:,.1f}".replace(",","."))       # fila atual
+        c3.metric("Em andamento", f"{em_andamento:,}".replace(",","."))             # WIP
+        c4.metric("Concluídos", f"{concl:,}".replace(",","."))
+
+# ==============================
+# 👥 Clientes
+# ==============================
+if not require_entregas(tabs[1]):
+    with tabs[1]:
+        dfg = apply_global_filters(dfe); b = get_basis_columns(basis)
         col1,col2 = st.columns(2)
         with col1:
-            st.markdown("##### Clientes com mais **tarefas** (Entregas)")
-            r1 = ranking(dfg, "empresa", "qtd_tarefas", get_basis_columns(basis), top=10)
+            st.markdown("**Mais tarefas (Entregas)**")
+            r1 = ranking(dfg, "empresa", "qtd_tarefas", b, top=10)
             st.dataframe(r1)
-            if not r1.empty:
-                st.plotly_chart(px.bar(r1, x="empresa", y="valor", title="Tarefas por Cliente (Entregas)"), use_container_width=True)
-            sel1 = st.selectbox("🔎 Detalhar cliente (tarefas)", ["<selecione>"] + r1["empresa"].tolist() if not r1.empty else ["<selecione>"], key="cli_r1")
-            if sel1 and sel1 != "<selecione>":
-                det = dfg[dfg["empresa"] == sel1].copy()
-                st.dataframe(det); st.download_button("⬇️ CSV", det.to_csv(index=False).encode("utf-8"), f"detalhe_tarefas_{sel1}.csv", "text/csv")
+            if not r1.empty: st.plotly_chart(px.bar(r1, x="empresa", y="valor", title="Tarefas por Cliente"), use_container_width=True)
         with col2:
-            st.markdown(f"##### Clientes com mais **entregas antecipadas** ({basis})")
-            r2 = ranking(dfg, "empresa", "qtd_antecipadas", get_basis_columns(basis), top=10)
+            st.markdown(f"**Mais entregas antecipadas ({basis})**")
+            r2 = ranking(dfg, "empresa", "qtd_antecipadas", b, top=10)
             st.dataframe(r2)
-            if not r2.empty:
-                st.plotly_chart(px.bar(r2, x="empresa", y="valor", title=f"Antecipadas ({basis}) por Cliente"), use_container_width=True)
-            sel2 = st.selectbox("🔎 Detalhar cliente (antecipadas)", ["<selecione>"] + r2["empresa"].tolist() if not r2.empty else ["<selecione>"], key="cli_r2")
-            if sel2 and sel2 != "<selecione>":
-                det = dfg[(dfg["empresa"] == sel2) & (dfg[get_basis_columns(basis)["antecipada"]] == True)].copy()
-                st.dataframe(det); st.download_button("⬇️ CSV", det.to_csv(index=False).encode("utf-8"), f"detalhe_antecipadas_{sel2}.csv", "text/csv")
+            if not r2.empty: st.plotly_chart(px.bar(r2, x="empresa", y="valor", title=f"Antecipadas ({basis})"), use_container_width=True)
 
-        # NOVO: clientes que mais solicitam (com base nas Solicitações)
-        st.markdown("##### Clientes com mais **solicitações**")
-        if isinstance(dfs, pd.DataFrame) and "empresa" in dfs.columns:
-            dsol = dfs.copy()
-            top_solic = dsol["empresa"].value_counts().reset_index()
-            top_solic.columns = ["empresa","solicitacoes"]
-            top_solic = top_solic.head(10)
-            st.dataframe(top_solic)
-            if not top_solic.empty:
-                st.plotly_chart(px.bar(top_solic, x="empresa", y="solicitacoes", title="Top 10 Clientes por Solicitações"), use_container_width=True)
-            sel4 = st.selectbox("🔎 Detalhar cliente (solicitações)", ["<selecione>"] + top_solic["empresa"].tolist() if not top_solic.empty else ["<selecione>"], key="cli_r4")
-            if sel4 and sel4 != "<selecione>":
-                dets = dsol[dsol["empresa"] == sel4].copy()
-                st.dataframe(dets); st.download_button("⬇️ CSV", dets.to_csv(index=False).encode("utf-8"), f"detalhe_solicitacoes_{sel4}.csv", "text/csv")
+        st.markdown(f"**Melhor {b['label']}**")
+        r3 = ranking(dfg, "empresa", "pct_no_prazo", b, top=10)
+        st.dataframe(r3)
+        if not r3.empty: st.plotly_chart(px.bar(r3, x="empresa", y="valor", title=b['label']), use_container_width=True)
+
+# ==============================
+# 🏢 Departamentos
+# ==============================
+if not require_entregas(tabs[2]):
+    with tabs[2]:
+        dfg = apply_global_filters(dfe); b = get_basis_columns(basis)
+        col1,col2 = st.columns(2)
+        with col1:
+            st.markdown(f"**{b['label']} — Ranking**")
+            r1 = ranking(dfg, "departamento", "pct_no_prazo", b, top=10)
+            st.dataframe(r1)
+            if not r1.empty: st.plotly_chart(px.bar(r1, x="departamento", y="valor", title=b['label']), use_container_width=True)
+        with col2:
+            st.markdown("**Atraso médio (dias)**")
+            r2 = ranking(dfg, "departamento", "atraso_medio", b, how="asc", top=10)
+            st.dataframe(r2)
+            if not r2.empty: st.plotly_chart(px.bar(r2, x="departamento", y="valor", title="Atraso médio (dias)"), use_container_width=True)
+
+# ==============================
+# 🧑‍💼 Colaboradores
+# ==============================
+if not require_entregas(tabs[3]):
+    with tabs[3]:
+        dfg = apply_global_filters(dfe); b = get_basis_columns(basis)
+        if "responsavel_entrega" not in dfg.columns:
+            st.info("Mapeie **responsavel_entrega** para ver rankings de colaboradores.")
         else:
-            st.info("Para ver 'clientes que mais solicitam', carregue **Solicitações** em '🗂️ Dados'.")
+            col1,col2 = st.columns(2)
+            with col1:
+                st.markdown(f"**{b['label']} — Ranking**")
+                r1 = ranking(dfg, "responsavel_entrega", "pct_no_prazo", b, top=10)
+                st.dataframe(r1)
+                if not r1.empty: st.plotly_chart(px.bar(r1, x="responsavel_entrega", y="valor", title=b['label']), use_container_width=True)
+            with col2:
+                st.markdown("**Volume de tarefas**")
+                r2 = ranking(dfg, "responsavel_entrega", "qtd_tarefas", b, top=10)
+                st.dataframe(r2)
+                if not r2.empty: st.plotly_chart(px.bar(r2, x="responsavel_entrega", y="valor", title="Volume"), use_container_width=True)
 
-        st.markdown(f"##### Clientes com **melhor {get_basis_columns(basis)['label']}**")
-        r3 = ranking(dfg, "empresa", "pct_no_prazo", get_basis_columns(basis), top=10)
-        st.dataframe(r3)
-        if not r3.empty:
-            st.plotly_chart(px.bar(r3, x="empresa", y="valor", title=get_basis_columns(basis)["label"]+" — Clientes"), use_container_width=True)
-        sel3 = st.selectbox("🔎 Detalhar cliente (no prazo)", ["<selecione>"] + r3["empresa"].tolist() if not r3.empty else ["<selecione>"], key="cli_r3")
-        if sel3 and sel3 != "<selecione>":
-            det = dfg[dfg["empresa"] == sel3].copy()
-            st.dataframe(det); st.download_button("⬇️ CSV", det.to_csv(index=False).encode("utf-8"), f"detalhe_prazo_{sel3}.csv", "text/csv")
-
-# ==============================
-# Aba: Departamentos
-# ==============================
-with tabs[2]:
-    st.subheader(f"🏢 Departamentos — {get_basis_columns(basis)['label']} e atraso médio")
-    if dfe is None or dfe.empty:
-        st.info("Carregue **Entregas** em '🗂️ Dados'.")
-    else:
-        dfg = global_filters(dfe, who="dep")
-        col1,col2 = st.columns(2)
-        with col1:
-            st.markdown(f"##### {get_basis_columns(basis)['label']} — Ranking")
-            r1 = ranking(dfg, "departamento", "pct_no_prazo", get_basis_columns(basis), top=10)
-            st.dataframe(r1)
-            if not r1.empty:
-                st.plotly_chart(px.bar(r1, x="departamento", y="valor", title=get_basis_columns(basis)['label']+" — Departamentos"), use_container_width=True)
-            sd1 = st.selectbox("🔎 Detalhar departamento (prazo)", ["<selecione>"] + r1["departamento"].tolist() if not r1.empty else ["<selecione>"], key="dep_r1")
-            if sd1 and sd1 != "<selecione>":
-                det = dfg[dfg["departamento"] == sd1].copy()
-                st.dataframe(det); st.download_button("⬇️ CSV", det.to_csv(index=False).encode("utf-8"), f"detalhe_dep_prazo_{sd1}.csv", "text/csv")
-        with col2:
-            st.markdown("##### Atraso médio (dias) — Ranking")
-            r2 = ranking(dfg, "departamento", "atraso_medio", get_basis_columns(basis), how="asc", top=10)  # menor = melhor
-            st.dataframe(r2)
-            if not r2.empty:
-                st.plotly_chart(px.bar(r2, x="departamento", y="valor", title="Atraso médio (dias) — Departamentos"), use_container_width=True)
-            sd2 = st.selectbox("🔎 Detalhar departamento (atraso médio)", ["<selecione>"] + r2["departamento"].tolist() if not r2.empty else ["<selecione>"], key="dep_r2")
-            if sd2 and sd2 != "<selecione>":
-                det = dfg[dfg["departamento"] == sd2].copy()
-                st.dataframe(det); st.download_button("⬇️ CSV", det.to_csv(index=False).encode("utf-8"), f"detalhe_dep_atraso_{sd2}.csv", "text/csv")
+            st.markdown(f"**Antecipadas ({basis})**")
+            r3 = ranking(dfg, "responsavel_entrega", "qtd_antecipadas", b, top=10)
+            st.dataframe(r3)
+            if not r3.empty: st.plotly_chart(px.bar(r3, x="responsavel_entrega", y="valor", title="Antecipadas"), use_container_width=True)
 
 # ==============================
-# Aba: Colaboradores
+# 📆 Linha do Tempo (com média móvel)
 # ==============================
-with tabs[3]:
-    st.subheader(f"🧑‍💼 Colaboradores — {get_basis_columns(basis)['label']}, volume e antecipadas")
-    if dfe is None or dfe.empty or "responsavel_entrega" not in dfe.columns:
-        st.info("Carregue **Entregas** e mapeie **responsavel_entrega** em '🗂️ Dados'.")
-    else:
-        dfg = global_filters(dfe, who="col")
-        col1,col2 = st.columns(2)
-        with col1:
-            st.markdown(f"##### {get_basis_columns(basis)['label']} — Ranking")
-            r1 = ranking(dfg, "responsavel_entrega", "pct_no_prazo", get_basis_columns(basis), top=10)
-            st.dataframe(r1)
-            if not r1.empty:
-                st.plotly_chart(px.bar(r1, x="responsavel_entrega", y="valor", title=get_basis_columns(basis)['label']+" — Colaboradores"), use_container_width=True)
-            sc1 = st.selectbox("🔎 Detalhar colaborador (prazo)", ["<selecione>"] + r1["responsavel_entrega"].tolist() if not r1.empty else ["<selecione>"], key="col_r1")
-            if sc1 and sc1 != "<selecione>":
-                det = dfg[dfg["responsavel_entrega"] == sc1].copy()
-                st.dataframe(det); st.download_button("⬇️ CSV", det.to_csv(index=False).encode("utf-8"), f"detalhe_col_prazo_{sc1}.csv", "text/csv")
-        with col2:
-            st.markdown("##### Volume de tarefas — Ranking")
-            r2 = ranking(dfg, "responsavel_entrega", "qtd_tarefas", get_basis_columns(basis), top=10)
-            st.dataframe(r2)
-            if not r2.empty:
-                st.plotly_chart(px.bar(r2, x="responsavel_entrega", y="valor", title="Volume de tarefas — Colaboradores"), use_container_width=True)
-            sc2 = st.selectbox("🔎 Detalhar colaborador (volume)", ["<selecione>"] + r2["responsavel_entrega"].tolist() if not r2.empty else ["<selecione>"], key="col_r2")
-            if sc2 and sc2 != "<selecione>":
-                det = dfg[dfg["responsavel_entrega"] == sc2].copy()
-                st.dataframe(det); st.download_button("⬇️ CSV", det.to_csv(index=False).encode("utf-8"), f"detalhe_col_volume_{sc2}.csv", "text/csv")
-
-        st.markdown(f"##### Entregas **antecipadas** ({basis}) — Ranking")
-        r3 = ranking(dfg, "responsavel_entrega", "qtd_antecipadas", get_basis_columns(basis), top=10)
-        st.dataframe(r3)
-        if not r3.empty:
-            st.plotly_chart(px.bar(r3, x="responsavel_entrega", y="valor", title=f"Antecipadas ({basis}) — Colaboradores"), use_container_width=True)
-        sc3 = st.selectbox("🔎 Detalhar colaborador (antecipadas)", ["<selecione>"] + r3["responsavel_entrega"].tolist() if not r3.empty else ["<selecione>"], key="col_r3")
-        if sc3 and sc3 != "<selecione>":
-            det = dfg[(dfg["responsavel_entrega"] == sc3) & (dfg[get_basis_columns(basis)["antecipada"]] == True)].copy()
-            st.dataframe(det); st.download_button("⬇️ CSV", det.to_csv(index=False).encode("utf-8"), f"detalhe_col_antecipadas_{sc3}.csv", "text/csv")
-
-# ==============================
-# Aba: Linha do Tempo (mensal)
-# ==============================
-with tabs[4]:
-    st.subheader(f"📆 Linha do Tempo — {get_basis_columns(basis)['label']} por mês")
-    if dfe is None or dfe.empty:
-        st.info("Carregue **Entregas** em '🗂️ Dados'.")
-    else:
-        df = dfe.copy()
-        # competência mensal segura
+if not require_entregas(tabs[4]):
+    with tabs[4]:
+        df = apply_global_filters(dfe); b = get_basis_columns(basis)
+        # base mês
         mes_series = None
         for base_col in ["competencia","data_vencimento","data_entrega"]:
             if base_col in df.columns:
@@ -547,11 +539,183 @@ with tabs[4]:
         if mes_series is None:
             mes_series = pd.Series([pd.Timestamp.today().to_period("M").strftime("%Y-%m")]*len(df), index=df.index)
         df["mes"] = mes_series
-        df["no_prazo_flag"] = df[get_basis_columns(basis)["no_prazo"]].astype("float")
+        df["no_prazo_flag"] = df[b["no_prazo"]].astype("float")
         g = df.groupby("mes").agg(no_prazo=("no_prazo_flag","mean"), tarefas=("no_prazo_flag","size")).reset_index()
-        g["no_prazo_%"] = g["no_prazo"] * 100
-        st.dataframe(g[["mes","tarefas","no_prazo_%"]].sort_values("mes"))
+        g["no_prazo_%"] = (g["no_prazo"] * 100).round(2)
+        # média móvel 3M
+        g = g.sort_values("mes")
+        g["MM3_%"] = g["no_prazo_%"].rolling(3).mean().round(2)
+        st.dataframe(g[["mes","tarefas","no_prazo_%","MM3_%"]])
         try:
-            st.plotly_chart(px.bar(g, x="mes", y="no_prazo_%", title=get_basis_columns(basis)['label']+" por mês"), use_container_width=True)
+            fig = px.line(g, x="mes", y=["no_prazo_%","MM3_%"], title=f"{b['label']} por mês (c/ MM3)")
+            st.plotly_chart(fig, use_container_width=True)
         except Exception:
             pass
+
+# ==============================
+# 📦 SLA & Backlog (enxuto)
+# ==============================
+if not require_entregas(tabs[5]):
+    with tabs[5]:
+        dfg = apply_global_filters(dfe); b = get_basis_columns(basis)
+        st.markdown("**SLA por Cliente (Top 10)**")
+        sla = ranking(dfg, "empresa", "pct_no_prazo", b, top=10)
+        st.dataframe(sla)
+        if not sla.empty: st.plotly_chart(px.bar(sla, x="empresa", y="valor", title=b["label"]), use_container_width=True)
+
+        st.markdown("**Backlog por faixa de atraso (apenas concluídas fora do prazo)**")
+        if b["atraso_dias"] in dfg.columns:
+            late = dfg[dfg[b["atraso_dias"]].fillna(0) > 0].copy()
+            bins = [-0.1,2,5,10,10000]
+            labels = ["1-2","3-5","6-10",">10"]
+            late["bucket_atraso"] = pd.cut(late[b["atraso_dias"]], bins=bins, labels=labels)
+            agg = late["bucket_atraso"].value_counts().reindex(labels).fillna(0).reset_index()
+            agg.columns = ["faixa","qtd"]
+            st.dataframe(agg)
+            st.plotly_chart(px.bar(agg, x="faixa", y="qtd", title="Distribuição de atraso (dias)"), use_container_width=True)
+        else:
+            st.info("Mapeie datas para calcular atraso.")
+
+# ==============================
+# 🧰 Capacidade & Carga (simples)
+# ==============================
+if not require_entregas(tabs[6]):
+    with tabs[6]:
+        dfg = apply_global_filters(dfe)
+        cap_sem = st.number_input("Capacidade por colaborador/semana (estimada)", min_value=1, max_value=500, value=25, step=1)
+        if "responsavel_entrega" not in dfg.columns:
+            st.info("Mapeie **responsavel_entrega**.")
+        else:
+            # carga por colaborador (últimas 4 semanas com base em data_entrega)
+            if "data_entrega" in dfg.columns:
+                dt = pd.to_datetime(dfg["data_entrega"], errors="coerce")
+                cutoff = pd.Timestamp.today() - pd.Timedelta(days=28)
+                base = dfg[dt >= cutoff]
+                carga = base.groupby("responsavel_entrega").size().reset_index(name="tarefas_4s")
+                carga["utilizacao_vs_cap"] = (carga["tarefas_4s"] / (cap_sem*4) * 100).round(1)
+                st.dataframe(carga.sort_values("utilizacao_vs_cap", ascending=False))
+                st.plotly_chart(px.bar(carga.sort_values("utilizacao_vs_cap", ascending=False),
+                                       x="responsavel_entrega", y="utilizacao_vs_cap",
+                                       title="Utilização vs capacidade (últimas 4 semanas, %)"),
+                                use_container_width=True)
+            else:
+                st.info("Necessário **data_entrega** para medir carga recente.")
+
+# ==============================
+# 🚨 Riscos & Alertas (regras simples)
+# ==============================
+if not require_entregas(tabs[7]):
+    with tabs[7]:
+        dfg = apply_global_filters(dfe); b = get_basis_columns(basis)
+        st.markdown("**Regras**: % no prazo < meta, atraso médio > 5 dias, sem prazo técnico, sem responsável.")
+        riscos = []
+
+        # por cliente
+        g_cli = dfg.groupby("empresa").agg(
+            pct=(b["no_prazo"], "mean"),
+            atraso=(b["atraso_dias"], "mean"),
+            sem_resp=("responsavel_entrega", lambda s: s.isna().mean() if len(s)>0 else np.nan),
+            sem_pt=("prazo_tecnico", lambda s: pd.to_datetime(s, errors="coerce").isna().mean() if len(s)>0 else np.nan)
+        ).reset_index()
+        g_cli["pct"] = g_cli["pct"]*100
+        if not g_cli.empty:
+            r1 = g_cli[(g_cli["pct"] < st.session_state.get("meta_ok", 95.0)) | (g_cli["atraso"] > 5) | (g_cli["sem_pt"] > 0.05) | (g_cli["sem_resp"] > 0.05)]
+            r1["score_risco"] = (
+                (np.maximum(0, 95 - r1["pct"]))*0.5 +
+                (np.maximum(0, r1["atraso"] - 5))*5 +
+                (r1["sem_pt"]*100)*0.2 +
+                (r1["sem_resp"]*100)*0.3
+            ).round(1)
+            riscos = r1.sort_values("score_risco", ascending=False).rename(columns={
+                "empresa":"entidade","pct":f"{b['label']}", "atraso":"atraso_medio"
+            })
+
+        if isinstance(riscos, pd.DataFrame) and not riscos.empty:
+            st.dataframe(riscos[["entidade",f"{b['label']}","atraso_medio","sem_pt","sem_resp","score_risco"]])
+            st.plotly_chart(px.bar(riscos.head(10), x="entidade", y="score_risco", title="Top riscos (clientes)"),
+                            use_container_width=True)
+        else:
+            st.success("Nenhum risco relevante pelas regras atuais.")
+
+# ==============================
+# 🔄 Processos (funil/gargalo/lead time)
+# ==============================
+with tabs[8]:
+    st.subheader("🔄 Processos")
+    if dfp is None or dfp.empty:
+        st.info("Carregue **Gestão de Processos** em '🗂️ Dados & Mapeamento'.")
+    else:
+        df = dfp.copy()
+        # filtros simples (processos)
+        col1,col2,col3 = st.columns(3)
+        with col1:
+            emp_p = st.multiselect("Clientes", sorted(df.get("empresa", pd.Series(dtype=str)).dropna().unique().tolist())) if "empresa" in df.columns else []
+        with col2:
+            dep_p = st.multiselect("Departamentos", sorted(df.get("departamento", pd.Series(dtype=str)).dropna().unique().tolist())) if "departamento" in df.columns else []
+        with col3:
+            resp_p = st.multiselect("Responsáveis", sorted(df.get("responsavel", pd.Series(dtype=str)).dropna().unique().tolist())) if "responsavel" in df.columns else []
+
+        mask = pd.Series(True, index=df.index)
+        if "empresa" in df.columns and emp_p: mask &= df["empresa"].isin(emp_p)
+        if "departamento" in df.columns and dep_p: mask &= df["departamento"].isin(dep_p)
+        if "responsavel" in df.columns and resp_p: mask &= df["responsavel"].isin(resp_p)
+        df = df[mask].copy()
+
+        # KPIs rápidos
+        lead_med = float(df["lead_time_dias"].mean()) if "lead_time_dias" in df.columns else np.nan
+        aging_med = float(df["aging_dias"].mean()) if "aging_dias" in df.columns else np.nan
+        em_and = int((df["status"]=="Em andamento").sum()) if "status" in df.columns else 0
+        concl = int((df["status"]=="Concluído").sum()) if "status" in df.columns else 0
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("Lead time médio (dias)", f"{lead_med:,.1f}".replace(",",".")) 
+        c2.metric("Aging médio (dias)", f"{aging_med:,.1f}".replace(",","."))    
+        c3.metric("Em andamento", f"{em_and:,}".replace(",","."))                
+        c4.metric("Concluídos", f"{concl:,}".replace(",","."))                   
+
+        # Funil por etapa
+        if "etapa_atual" in df.columns:
+            funil = df["etapa_atual"].value_counts().reset_index()
+            funil.columns = ["etapa","qtd"]
+            st.plotly_chart(px.bar(funil, x="etapa", y="qtd", title="Funil por etapa"), use_container_width=True)
+            st.dataframe(funil)
+
+        # Gargalos: etapa com maior aging médio
+        if "etapa_atual" in df.columns and "aging_dias" in df.columns:
+            garg = df.groupby("etapa_atual")["aging_dias"].mean().reset_index().dropna()
+            garg = garg.sort_values("aging_dias", ascending=False)
+            st.plotly_chart(px.bar(garg, x="etapa_atual", y="aging_dias", title="Gargalo (aging médio por etapa)"),
+                            use_container_width=True)
+            st.dataframe(garg)
+
+        # Produtividade por responsável (lead time concluído)
+        if "responsavel" in df.columns and "lead_time_dias" in df.columns:
+            prod = df[df["status"]=="Concluído"].groupby("responsavel")["lead_time_dias"].mean().reset_index().dropna()
+            prod = prod.sort_values("lead_time_dias")
+            st.plotly_chart(px.bar(prod.head(10), x="responsavel", y="lead_time_dias", title="Produtividade (menor lead time)"),
+                            use_container_width=True)
+            st.dataframe(prod.head(10))
+
+# ==============================
+# 🧪 Qualidade & Dicionário
+# ==============================
+with tabs[10]:
+    st.subheader("🧪 Qualidade dos Dados & Dicionário")
+    if dfe is None or dfe.empty:
+        st.info("Carregue **Entregas** para validar mapeamento e qualidade.")
+    else:
+        df = dfe.copy()
+        st.markdown("**Colunas presentes (Entregas):**")
+        st.write(sorted(df.columns.tolist()))
+        chk_cols = ["empresa","obrigacao","departamento","responsavel_entrega","data_entrega","prazo_tecnico","data_legal","status"]
+        miss = [c for c in chk_cols if c not in df.columns]
+        if miss:
+            st.warning(f"⚠️ Colunas úteis ausentes: {', '.join(miss)}.")
+        else:
+            st.success("✅ Conjunto de colunas essenciais disponível.")
+        st.markdown("**Nulos por coluna (top 15):**")
+        nulls = df.isna().mean().sort_values(ascending=False).head(15).reset_index()
+        nulls.columns = ["coluna","% nulos"]; nulls["% nulos"] = (nulls["% nulos"]*100).round(1)
+        st.dataframe(nulls)
+        st.markdown("**Amostra (50 primeiras):**")
+        st.dataframe(df.head(50))
+        st.download_button("⬇️ Exportar base filtrada (CSV)", apply_global_filters(df).to_csv(index=False).encode("utf-8"), "base_filtrada.csv", "text/csv")
