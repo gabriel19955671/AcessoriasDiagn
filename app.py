@@ -1,9 +1,8 @@
-# app.py — Diagnóstico Acessórias (v5.0 simples)
-# Suba a planilha → filtros claros por aba → dashboards objetivos
-# Abas: Dados Brutos, KPIs, Departamentos, Responsáveis, Clientes, Processos
+# app.py — Diagnóstico Acessórias (v5.1)
+# Correção de data (TypeError) + KPIs com dashboards estruturados + Relatório de Apontamentos
 
 import difflib
-from datetime import datetime
+from datetime import datetime, date
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -13,11 +12,11 @@ import streamlit as st
 # Configuração
 # =============================================================================
 st.set_page_config(page_title="Diagnóstico Acessórias", layout="wide")
-st.title("📊 Diagnóstico Acessórias — v5.0 (simples e objetivo)")
+st.title("📊 Diagnóstico Acessórias — v5.1")
 st.caption("Fluxo: ① Dados Brutos → ② KPIs & Dashboards por aba → ③ Exportar resultados")
 
 # =============================================================================
-# Leitura robusta de arquivos
+# Leitura robusta
 # =============================================================================
 def read_any_csv(uploaded_file) -> pd.DataFrame:
     encodings = ["utf-8", "utf-8-sig", "latin1", "cp1252", "iso-8859-1", "utf-16", "utf-16le", "utf-16be"]
@@ -39,16 +38,13 @@ def read_any_csv(uploaded_file) -> pd.DataFrame:
         raise
 
 def try_read_excel_or_csv(uploaded_file) -> pd.DataFrame:
-    """Tenta Excel (vários engines) e cai para CSV (vários encodings)."""
     name = (getattr(uploaded_file, "name", "") or "").lower()
-
     def _try(fn, *a, **k):
         try:
             uploaded_file.seek(0)
             return fn(*a, **k)
         except Exception:
             return None
-
     # Excel
     if name.endswith((".xlsx", ".xlsm")):
         df = _try(pd.read_excel, uploaded_file, engine="openpyxl", dtype=str)
@@ -57,17 +53,13 @@ def try_read_excel_or_csv(uploaded_file) -> pd.DataFrame:
         df = _try(pd.read_excel, uploaded_file, engine="pyxlsb", dtype=str)
         if df is not None: return df
     if name.endswith(".xls"):
-        # xlrd (xls antigo)
         df = _try(pd.read_excel, uploaded_file, engine="xlrd", dtype=str)
         if df is not None: return df
-        # às vezes .xls abre com openpyxl (quando é na verdade xlsx renomeado)
         df = _try(pd.read_excel, uploaded_file, engine="openpyxl", dtype=str)
         if df is not None: return df
-    # Tenta qualquer engine possível
     for eng in ("openpyxl", "pyxlsb", "xlrd"):
         df = _try(pd.read_excel, uploaded_file, engine=eng, dtype=str)
         if df is not None: return df
-
     # CSV robusto
     return read_any_csv(uploaded_file)
 
@@ -82,7 +74,6 @@ def to_datetime_safe(s):
     return pd.to_datetime(s, errors="coerce", dayfirst=True)
 
 def s_get(df, candidates, default=np.nan):
-    """Devolve a 1ª coluna existente entre candidates (string ou lista)."""
     if isinstance(candidates, str):
         return df[candidates] if candidates in df.columns else pd.Series(default, index=df.index)
     for c in candidates:
@@ -101,7 +92,6 @@ def norm_status(x):
     return m.get(s, x)
 
 def canonicalize_entregas(df: pd.DataFrame) -> pd.DataFrame:
-    """Cria colunas canônicas para a análise: empresa, dep, colaborador."""
     if df is None or df.empty: return df
     df = df.copy()
     if "empresa" not in df.columns:
@@ -115,31 +105,22 @@ def canonicalize_entregas(df: pd.DataFrame) -> pd.DataFrame:
 def enrich_entregas(df_ent: pd.DataFrame) -> pd.DataFrame:
     if df_ent is None or df_ent.empty: return df_ent
     df = normalize_headers(df_ent.copy())
-
-    # Datas principais
     df["data_entrega"]    = to_datetime_safe(s_get(df, "data_entrega", np.nan))
     df["prazo_tecnico"]   = to_datetime_safe(s_get(df, "prazo_tecnico", np.nan))
     df["data_legal"]      = to_datetime_safe(s_get(df, "data_legal", np.nan))
     df["data_vencimento"] = to_datetime_safe(s_get(df, "data_vencimento", np.nan))
     df["competencia"]     = to_datetime_safe(s_get(df, "competencia", np.nan))
-
     if "status" in df.columns:
         df["status"] = df["status"].map(norm_status).fillna(df["status"])
-
     de, pt, dl = df["data_entrega"], df["prazo_tecnico"], df["data_legal"]
-
-    # Métricas base Técnico
     has_t = de.notna() & pt.notna()
     df["no_prazo_tecnico"]    = np.where(has_t & (de <= pt), True, np.where(has_t, False, np.nan))
     df["antecipada_tecnico"]  = has_t & (de < pt)
     df["atraso_tecnico_dias"] = np.where(has_t, (de - pt).dt.days.clip(lower=0), np.nan)
-
-    # Métricas base Legal
     has_l = de.notna() & dl.notna()
     df["no_prazo_legal"]      = np.where(has_l & (de <= dl), True, np.where(has_l, False, np.nan))
     df["antecipada_legal"]    = has_l & (de < dl)
     df["atraso_legal_dias"]   = np.where(has_l, (de - dl).dt.days.clip(lower=0), np.nan)
-
     return canonicalize_entregas(df)
 
 def enrich_procs(dfp: pd.DataFrame) -> pd.DataFrame:
@@ -180,9 +161,22 @@ with st.sidebar:
     st.header("⚙️ Configuração geral")
     basis = st.radio("Base de análise", ["Técnico", "Legal"], horizontal=True, index=0)
     meta_ok = st.number_input("Meta de % no prazo (OK)", min_value=50.0, max_value=100.0, value=95.0, step=0.5)
-    st.caption("Usada no ranking de risco.")
+    st.caption("Usada no ranking de risco e apontamentos.")
     st.divider()
     st.caption("Dica: Carregue a planilha em **Dados Brutos** e use os filtros no topo de cada aba.")
+
+# =============================================================================
+# Util: coerção de datas (corrige TypeError)
+# =============================================================================
+def _coerce_date_input(v):
+    """Aceita None | date | datetime | tuple(date,date). Retorna pd.Timestamp ou None."""
+    if v is None:
+        return None
+    if isinstance(v, tuple) and len(v) > 0:
+        v = v[0]  # pega início do range, se vier como tupla
+    if isinstance(v, (pd.Timestamp, datetime, date)):
+        return pd.Timestamp(v)
+    return None
 
 # =============================================================================
 # Componentes de filtro (por aba)
@@ -190,14 +184,12 @@ with st.sidebar:
 def date_candidates(df: pd.DataFrame):
     keys = ["competencia","data_vencimento","data_entrega","data_legal","prazo_tecnico","abertura","conclusao"]
     cands = [c for c in keys if c in df.columns]
-    # inclui qualquer outra coluna datetime
     for c in df.columns:
         if c not in cands and pd.api.types.is_datetime64_any_dtype(df[c]):
             cands.append(c)
     return cands
 
 def filter_panel(df: pd.DataFrame, key: str, show_cols=("empresa","dep","colaborador"), default_date=None):
-    """Retorna df filtrado + dict seleções. Filtros compactos e claros."""
     if df is None or df.empty:
         st.info("Carregue a base em **Dados Brutos**.")
         return df, {}
@@ -210,11 +202,14 @@ def filter_panel(df: pd.DataFrame, key: str, show_cols=("empresa","dep","colabor
                 default_idx = dcols.index(default_date)
             dcol = st.selectbox("Coluna de data", ["<sem filtro>"] + dcols, index=(default_idx+1 if dcols else 0), key=f"dcol_{key}")
         with c2:
-            di = st.date_input("De", value=None, key=f"di_{key}") if dcol and dcol != "<sem filtro>" else None
+            _di = st.date_input("De", value=None, key=f"di_{key}") if dcol and dcol != "<sem filtro>" else None
         with c3:
-            dfim = st.date_input("Até", value=None, key=f"df_{key}") if dcol and dcol != "<sem filtro>" else None
+            _df = st.date_input("Até", value=None, key=f"df_{key}") if dcol and dcol != "<sem filtro>" else None
         with c4:
             topn = st.number_input("Top N", min_value=5, max_value=50, value=10, step=1, key=f"topn_{key}")
+
+        di = _coerce_date_input(_di)
+        dfim = _coerce_date_input(_df)
 
         with st.expander("Filtros avançados"):
             cols = st.columns(3)
@@ -227,32 +222,27 @@ def filter_panel(df: pd.DataFrame, key: str, show_cols=("empresa","dep","colabor
                 else:
                     sel[c] = []
 
-        # aplicar filtros
         mask = pd.Series(True, index=df.index)
         if dcol and dcol != "<sem filtro>" and dcol in df.columns:
             dts = pd.to_datetime(df[dcol], errors="coerce")
-            if di:   mask &= dts.dt.date >= di
-            if dfim: mask &= dts.dt.date <= dfim
+            if di is not None:   mask &= dts >= di
+            if dfim is not None: mask &= dts <= dfim
         for c, v in sel.items():
             if v and c in df.columns:
                 mask &= df[c].astype(str).isin(v)
 
         fdf = df[mask].copy()
-        # botão limpar
         st.caption(f"Linhas após filtro: **{len(fdf):,}**".replace(",", "."))
         return fdf, {"dcol": dcol, "di": di, "df": dfim, "topn": topn, **sel}
 
 def safe_metric(value, fmt="num"):
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return "—"
-    if fmt == "pct":
-        return f"{value:,.1f}%".replace(",", ".")
-    if fmt == "num1":
-        return f"{value:,.1f}".replace(",", ".")
+    if fmt == "pct":  return f"{value:,.1f}%".replace(",", ".")
+    if fmt == "num1": return f"{value:,.1f}".replace(",", ".")
     return f"{int(value):,}".replace(",", ".")
 
 def ranking(df, group_col, metric, top=10, asc=False):
-    """metric: dict keys -> 'no_prazo' | 'qtd' | 'antecipada' | 'atraso' (nome da coluna)"""
     if df is None or df.empty or group_col not in df.columns:
         return pd.DataFrame(columns=[group_col, "valor"])
     if metric.get("qtd"):
@@ -309,7 +299,7 @@ with tabs[0]:
     st.markdown("### Visualização rápida")
     if dfe is not None and not dfe.empty:
         df_show, _ = filter_panel(dfe, key="raw", show_cols=("empresa","dep","colaborador"), default_date="competencia")
-        st.dataframe(df_show)  # mostra tudo (pode ser grande)
+        st.dataframe(df_show)
         st.download_button("⬇️ Baixar (CSV filtrado)", df_show.to_csv(index=False).encode("utf-8"), "entregas_filtrado.csv", "text/csv")
     else:
         st.info("Envie a base de **Entregas** para visualizar.")
@@ -320,7 +310,7 @@ with tabs[0]:
             st.download_button("⬇️ Baixar Processos (CSV)", dfp.to_csv(index=False).encode("utf-8"), "processos.csv", "text/csv")
 
 # =============================================================================
-# Aba 2 — KPIs Gerais
+# Aba 2 — KPIs Gerais (dashboards estruturados + relatório de apontamentos)
 # =============================================================================
 with tabs[1]:
     st.subheader("2) KPIs Gerais")
@@ -332,7 +322,7 @@ with tabs[1]:
         dfg, sel = filter_panel(dfe, key="kpi", show_cols=("empresa","dep","colaborador"), default_date="competencia")
 
         total = len(dfg)
-        pct_prazo = dfg[b["no_prazo"]].mean()*100 if b["no_prazo"] in dfg.columns else np.nan
+        pct_prazo = (dfg[b["no_prazo"]].mean()*100) if b["no_prazo"] in dfg.columns else np.nan
         atraso_med = dfg[b["atraso"]].mean() if b["atraso"] in dfg.columns else np.nan
         antecip = dfg[b["antecipada"]].sum() if b["antecipada"] in dfg.columns else 0
 
@@ -342,7 +332,8 @@ with tabs[1]:
         c3.metric("Entregas antecipadas", safe_metric(antecip))
         c4.metric("Tarefas (base)", safe_metric(total))
 
-        # Linha do tempo (mês)
+        st.markdown("### Dashboards")
+        # 1) % no prazo por mês
         base_col = "competencia" if "competencia" in dfg.columns else ("data_vencimento" if "data_vencimento" in dfg.columns else "data_entrega")
         if base_col in dfg.columns and b["no_prazo"] in dfg.columns:
             tmp = dfg.copy()
@@ -353,7 +344,7 @@ with tabs[1]:
             g = g.sort_values("mes")
             st.plotly_chart(px.line(g, x="mes", y="pct_%", title=f"{b['label']} por mês"), use_container_width=True)
 
-        # Distribuição de atraso (apenas fora do prazo)
+        # 2) Distribuição de atraso (somente fora do prazo)
         if b["atraso"] in dfg.columns:
             late = dfg[dfg[b["atraso"]].fillna(0) > 0].copy()
             if not late.empty:
@@ -362,6 +353,69 @@ with tabs[1]:
                 dist = late["faixa"].value_counts().reindex(labels).fillna(0).reset_index()
                 dist.columns = ["faixa","qtd"]
                 st.plotly_chart(px.bar(dist, x="faixa", y="qtd", title="Atraso — distribuição (dias)"), use_container_width=True)
+
+        # 3) Top clientes com risco (score simples)
+        if "empresa" in dfg.columns:
+            aux = dfg.copy()
+            aux["_no_prazo"] = aux[b["no_prazo"]].astype(float) if b["no_prazo"] in aux.columns else np.nan
+            aux["_atraso"]   = aux[b["atraso"]].astype(float) if b["atraso"]   in aux.columns else np.nan
+            aux["_sem_resp"] = aux["colaborador"].isna().astype(float) if "colaborador" in aux.columns else np.nan
+            aux["_sem_pt"]   = pd.to_datetime(aux["prazo_tecnico"], errors="coerce").isna().astype(float) if "prazo_tecnico" in aux.columns else np.nan
+            g = aux.groupby("empresa").agg(
+                pct=("_no_prazo","mean"),
+                atraso=("_atraso","mean"),
+                sem_resp=("_sem_resp","mean"),
+                sem_pt=("_sem_pt","mean")
+            ).reset_index()
+            g["pct"] = (g["pct"]*100).round(1)
+            for c in ["sem_resp","sem_pt"]:
+                if g[c].isna().all(): g[c] = 0.0
+            g["sem_resp"] = (g["sem_resp"]*100).round(1)
+            g["sem_pt"]   = (g["sem_pt"]*100).round(1)
+            g["score_risco"] = (
+                np.maximum(0, meta_ok - g["pct"]) * 0.5 +
+                np.maximum(0, g["atraso"] - 5) * 5 +
+                g["sem_pt"] * 0.2 +
+                g["sem_resp"] * 0.3
+            ).round(1)
+            top_risk = g.sort_values("score_risco", ascending=False).head(10)
+            st.plotly_chart(px.bar(top_risk, x="empresa", y="score_risco", title="Top riscos (clientes)"), use_container_width=True)
+
+        # ================= Relatório de Apontamentos =================
+        st.markdown("### 📝 Relatório de Apontamentos (automático)")
+        apont_textos = []
+        if not np.isnan(pct_prazo):
+            if pct_prazo >= meta_ok:
+                apont_textos.append(f"✅ Cumprimento global **{pct_prazo:.1f}%** (acima da meta **{meta_ok:.1f}%**).")
+            else:
+                apont_textos.append(f"⚠️ Cumprimento global **{pct_prazo:.1f}%** (abaixo da meta **{meta_ok:.1f}%**).")
+        if not np.isnan(atraso_med):
+            if atraso_med > 5:
+                apont_textos.append(f"🚨 **Atraso médio {atraso_med:.1f} dias** — severidade elevada (meta recomendada ≤ 5d).")
+            elif atraso_med > 0:
+                apont_textos.append(f"ℹ️ Atraso médio **{atraso_med:.1f} dias** (controlado).")
+        if isinstance(antecip, (int, float)) and antecip > 0:
+            apont_textos.append(f"🏁 **{int(antecip)}** entregas antecipadas — boa eficiência em planejamento.")
+        if 'empresa' in dfg.columns and b["atraso"] in dfg.columns:
+            atrasadas_cli = dfg[dfg[b["atraso"]].fillna(0) > 0].groupby("empresa").size().reset_index(name="qtd").sort_values("qtd", ascending=False).head(5)
+            if not atrasadas_cli.empty:
+                top_cli = atrasadas_cli.iloc[0]
+                apont_textos.append(f"🔍 Maior volume de atrasos no cliente **{top_cli['empresa']}** (**{int(top_cli['qtd'])}** tarefas).")
+
+        if apont_textos:
+            for t in apont_textos:
+                st.write("- " + t)
+        else:
+            st.write("- Sem apontamentos relevantes com os filtros atuais.")
+
+        # Tabela-resumo de destaques para exportar
+        destaques = []
+        destaques.append({"indicador": "Cumprimento global", "valor": None if np.isnan(pct_prazo) else round(pct_prazo,1), "meta": meta_ok, "obs": "Base " + basis})
+        destaques.append({"indicador": "Atraso médio (dias)", "valor": None if np.isnan(atraso_med) else round(atraso_med,1), "meta": 5, "obs": "Recomendação ≤ 5"})
+        destaques.append({"indicador": "Entregas antecipadas (qtd)", "valor": int(antecip) if isinstance(antecip,(int,float)) else 0, "meta": None, "obs": ""})
+        df_destaque = pd.DataFrame(destaques)
+        st.dataframe(df_destaque)
+        st.download_button("⬇️ Baixar 'Relatório de Apontamentos' (CSV)", df_destaque.to_csv(index=False).encode("utf-8"), "relatorio_apontamentos.csv", "text/csv")
 
 # =============================================================================
 # Aba 3 — Departamentos
@@ -376,8 +430,8 @@ with tabs[2]:
         dfg, sel = filter_panel(dfe, key="dep", show_cols=("dep","empresa"), default_date="competencia")
         topn = sel.get("topn", 10)
 
-        r_qtd = ranking(dfg, "dep", {"qtd": True}, top=topn)
-        r_prazo = ranking(dfg, "dep", {"no_prazo": b["no_prazo"]}, top=topn)
+        r_qtd    = ranking(dfg, "dep", {"qtd": True}, top=topn)
+        r_prazo  = ranking(dfg, "dep", {"no_prazo": b["no_prazo"]}, top=topn)
         r_atraso = ranking(dfg, "dep", {"atraso": b["atraso"]}, top=topn, asc=True)
 
         col1, col2 = st.columns(2)
@@ -412,7 +466,7 @@ with tabs[3]:
             st.info("Não encontrei coluna de responsável. Tente nomear como 'responsavel' ou 'responsavel_entrega'.")
         else:
             topn = sel.get("topn", 10)
-            r_qtd = ranking(dfg, "colaborador", {"qtd": True}, top=topn)
+            r_qtd   = ranking(dfg, "colaborador", {"qtd": True}, top=topn)
             r_prazo = ranking(dfg, "colaborador", {"no_prazo": b["no_prazo"]}, top=topn)
             r_antec = ranking(dfg, "colaborador", {"antecipada": b["antecipada"]}, top=topn)
 
@@ -446,11 +500,10 @@ with tabs[4]:
         dfg, sel = filter_panel(dfe, key="cli", show_cols=("empresa","dep"), default_date="competencia")
         topn = sel.get("topn", 10)
 
-        r_qtd = ranking(dfg, "empresa", {"qtd": True}, top=topn)
+        r_qtd   = ranking(dfg, "empresa", {"qtd": True}, top=topn)
         r_prazo = ranking(dfg, "empresa", {"no_prazo": b["no_prazo"]}, top=topn)
         r_antec = ranking(dfg, "empresa", {"antecipada": b["antecipada"]}, top=topn)
 
-        # atrasadas (contagem)
         if b["atraso"] in dfg.columns:
             atrasadas = dfg[dfg[b["atraso"]].fillna(0) > 0].groupby("empresa").size().reset_index(name="valor").sort_values("valor", ascending=False).head(topn)
         else:
