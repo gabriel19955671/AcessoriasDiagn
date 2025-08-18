@@ -1,5 +1,13 @@
-# app.py — Diagnóstico Acessórias (v5.1)
-# Correção de data (TypeError) + KPIs com dashboards estruturados + Relatório de Apontamentos
+# app.py — Diagnóstico Acessórias (v5.2)
+# Novidades v5.2:
+# - KPIs Gerais: REMOVIDO o gráfico de linha e incluídos gráficos compactos e organizados:
+#     • Donut "Cumprimento" (no prazo vs fora vs n/a)
+#     • Barras "Atraso: distribuição por faixa"
+#     • Barras "Top clientes por atraso médio"
+#     • Barras "Top departamentos por cumprimento"
+#     • Heatmap (opcional) mês x departamento de % no prazo (só aparece se houver dados)
+# - Novas métricas auxiliares nos KPIs: % sem prazo técnico, % sem responsável
+# - Mantido Relatório de Apontamentos
 
 import difflib
 from datetime import datetime, date
@@ -12,7 +20,7 @@ import streamlit as st
 # Configuração
 # =============================================================================
 st.set_page_config(page_title="Diagnóstico Acessórias", layout="wide")
-st.title("📊 Diagnóstico Acessórias — v5.1")
+st.title("📊 Diagnóstico Acessórias — v5.2")
 st.caption("Fluxo: ① Dados Brutos → ② KPIs & Dashboards por aba → ③ Exportar resultados")
 
 # =============================================================================
@@ -161,19 +169,19 @@ with st.sidebar:
     st.header("⚙️ Configuração geral")
     basis = st.radio("Base de análise", ["Técnico", "Legal"], horizontal=True, index=0)
     meta_ok = st.number_input("Meta de % no prazo (OK)", min_value=50.0, max_value=100.0, value=95.0, step=0.5)
-    st.caption("Usada no ranking de risco e apontamentos.")
+    st.caption("Usada no score de risco e apontamentos.")
     st.divider()
     st.caption("Dica: Carregue a planilha em **Dados Brutos** e use os filtros no topo de cada aba.")
 
 # =============================================================================
-# Util: coerção de datas (corrige TypeError)
+# Util: coerção de datas (corrige TypeError do date_input)
 # =============================================================================
 def _coerce_date_input(v):
     """Aceita None | date | datetime | tuple(date,date). Retorna pd.Timestamp ou None."""
     if v is None:
         return None
     if isinstance(v, tuple) and len(v) > 0:
-        v = v[0]  # pega início do range, se vier como tupla
+        v = v[0]  # início do range, se vier como tupla
     if isinstance(v, (pd.Timestamp, datetime, date)):
         return pd.Timestamp(v)
     return None
@@ -310,7 +318,7 @@ with tabs[0]:
             st.download_button("⬇️ Baixar Processos (CSV)", dfp.to_csv(index=False).encode("utf-8"), "processos.csv", "text/csv")
 
 # =============================================================================
-# Aba 2 — KPIs Gerais (dashboards estruturados + relatório de apontamentos)
+# Aba 2 — KPIs Gerais (gráficos compactos + relatório)
 # =============================================================================
 with tabs[1]:
     st.subheader("2) KPIs Gerais")
@@ -320,73 +328,104 @@ with tabs[1]:
     else:
         b = get_basis(basis)
         dfg, sel = filter_panel(dfe, key="kpi", show_cols=("empresa","dep","colaborador"), default_date="competencia")
+        n = sel.get("topn", 10)
 
         total = len(dfg)
         pct_prazo = (dfg[b["no_prazo"]].mean()*100) if b["no_prazo"] in dfg.columns else np.nan
         atraso_med = dfg[b["atraso"]].mean() if b["atraso"] in dfg.columns else np.nan
         antecip = dfg[b["antecipada"]].sum() if b["antecipada"] in dfg.columns else 0
 
-        c1, c2, c3, c4 = st.columns(4)
+        # Novas métricas auxiliares
+        pct_sem_pt  = (pd.to_datetime(dfg.get("prazo_tecnico", pd.NaT), errors="coerce").isna().mean()*100) if "prazo_tecnico" in dfg.columns else np.nan
+        pct_sem_resp = (dfg.get("colaborador").isna().mean()*100) if "colaborador" in dfg.columns else np.nan
+
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric(b["label"], safe_metric(pct_prazo, "pct"))
         c2.metric("Atraso médio (dias)", safe_metric(atraso_med, "num1"))
         c3.metric("Entregas antecipadas", safe_metric(antecip))
         c4.metric("Tarefas (base)", safe_metric(total))
+        c5.metric("% sem prazo técnico", safe_metric(pct_sem_pt, "pct") if not np.isnan(pct_sem_pt) else "—")
+        c6.metric("% sem responsável", safe_metric(pct_sem_resp, "pct") if not np.isnan(pct_sem_resp) else "—")
 
-        st.markdown("### Dashboards")
-        # 1) % no prazo por mês
-        base_col = "competencia" if "competencia" in dfg.columns else ("data_vencimento" if "data_vencimento" in dfg.columns else "data_entrega")
-        if base_col in dfg.columns and b["no_prazo"] in dfg.columns:
-            tmp = dfg.copy()
-            tmp["mes"] = pd.to_datetime(tmp[base_col], errors="coerce").dt.to_period("M").astype(str)
-            tmp["no_prazo_flag"] = tmp[b["no_prazo"]].astype(float)
-            g = tmp.groupby("mes").agg(pct=("no_prazo_flag","mean"), tarefas=("no_prazo_flag","size")).reset_index()
-            g["pct_%"] = (g["pct"]*100).round(1)
-            g = g.sort_values("mes")
-            st.plotly_chart(px.line(g, x="mes", y="pct_%", title=f"{b['label']} por mês"), use_container_width=True)
+        st.markdown("### Dashboards (compactos)")
+        # 1) Donut: Cumprimento (no prazo / fora / n/a)
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if b["no_prazo"] in dfg.columns:
+                donut = pd.Series(
+                    np.where(dfg[b["no_prazo"]]==True, "No prazo",
+                    np.where(dfg[b["no_prazo"]]==False, "Fora do prazo", "Sem base")),
+                    name="status"
+                ).value_counts().reset_index()
+                donut.columns = ["status","qtd"]
+                if not donut.empty:
+                    st.plotly_chart(px.pie(donut, names="status", values="qtd", hole=0.55, title="Cumprimento (donut)"),
+                                    use_container_width=True)
+            else:
+                st.info("Não foi possível calcular o cumprimento (coluna de base ausente).")
 
-        # 2) Distribuição de atraso (somente fora do prazo)
-        if b["atraso"] in dfg.columns:
-            late = dfg[dfg[b["atraso"]].fillna(0) > 0].copy()
-            if not late.empty:
-                bins = [-0.1,2,5,10,10000]; labels = ["1-2","3-5","6-10",">10"]
-                late["faixa"] = pd.cut(late[b["atraso"]], bins=bins, labels=labels)
-                dist = late["faixa"].value_counts().reindex(labels).fillna(0).reset_index()
-                dist.columns = ["faixa","qtd"]
-                st.plotly_chart(px.bar(dist, x="faixa", y="qtd", title="Atraso — distribuição (dias)"), use_container_width=True)
+        # 2) Barras: distribuição de atraso (apenas fora do prazo)
+        with col_b:
+            if b["atraso"] in dfg.columns:
+                late = dfg[dfg[b["atraso"]].fillna(0) > 0].copy()
+                if not late.empty:
+                    bins = [-0.1,2,5,10,10000]; labels = ["1-2","3-5","6-10",">10"]
+                    late["faixa"] = pd.cut(late[b["atraso"]], bins=bins, labels=labels)
+                    dist = late["faixa"].value_counts().reindex(labels).fillna(0).reset_index()
+                    dist.columns = ["faixa","qtd"]
+                    st.plotly_chart(px.bar(dist, x="faixa", y="qtd", title="Atraso — distribuição (dias)"),
+                                    use_container_width=True)
+                else:
+                    st.info("Não há entregas com atraso nos filtros atuais.")
+            else:
+                st.info("Não foi possível calcular a distribuição de atrasos (coluna ausente).")
 
-        # 3) Top clientes com risco (score simples)
-        if "empresa" in dfg.columns:
-            aux = dfg.copy()
-            aux["_no_prazo"] = aux[b["no_prazo"]].astype(float) if b["no_prazo"] in aux.columns else np.nan
-            aux["_atraso"]   = aux[b["atraso"]].astype(float) if b["atraso"]   in aux.columns else np.nan
-            aux["_sem_resp"] = aux["colaborador"].isna().astype(float) if "colaborador" in aux.columns else np.nan
-            aux["_sem_pt"]   = pd.to_datetime(aux["prazo_tecnico"], errors="coerce").isna().astype(float) if "prazo_tecnico" in aux.columns else np.nan
-            g = aux.groupby("empresa").agg(
-                pct=("_no_prazo","mean"),
-                atraso=("_atraso","mean"),
-                sem_resp=("_sem_resp","mean"),
-                sem_pt=("_sem_pt","mean")
-            ).reset_index()
-            g["pct"] = (g["pct"]*100).round(1)
-            for c in ["sem_resp","sem_pt"]:
-                if g[c].isna().all(): g[c] = 0.0
-            g["sem_resp"] = (g["sem_resp"]*100).round(1)
-            g["sem_pt"]   = (g["sem_pt"]*100).round(1)
-            g["score_risco"] = (
-                np.maximum(0, meta_ok - g["pct"]) * 0.5 +
-                np.maximum(0, g["atraso"] - 5) * 5 +
-                g["sem_pt"] * 0.2 +
-                g["sem_resp"] * 0.3
-            ).round(1)
-            top_risk = g.sort_values("score_risco", ascending=False).head(10)
-            st.plotly_chart(px.bar(top_risk, x="empresa", y="score_risco", title="Top riscos (clientes)"), use_container_width=True)
+        # 3) Barras: Top clientes por atraso médio
+        col_c, col_d = st.columns(2)
+        with col_c:
+            if "empresa" in dfg.columns and b["atraso"] in dfg.columns:
+                cli_atraso = dfg.groupby("empresa")[b["atraso"]].mean().reset_index().dropna().sort_values(b["atraso"], ascending=False).head(n)
+                if not cli_atraso.empty:
+                    st.plotly_chart(px.bar(cli_atraso, x="empresa", y=b["atraso"], title="Top clientes por atraso médio (dias)"),
+                                    use_container_width=True)
+                    st.dataframe(cli_atraso.rename(columns={b["atraso"]:"atraso_medio_dias"}))
+                else:
+                    st.info("Sem dados de atraso médio por cliente.")
+            else:
+                st.info("Não foi possível calcular atraso médio por cliente.")
+
+        # 4) Barras: Top departamentos por cumprimento
+        with col_d:
+            if "dep" in dfg.columns and b["no_prazo"] in dfg.columns:
+                dep_prazo = (dfg.groupby("dep")[b["no_prazo"]].mean()*100).reset_index().dropna().sort_values(b["no_prazo"], ascending=False).head(n)
+                dep_prazo.columns = ["dep","pct_no_prazo"]
+                if not dep_prazo.empty:
+                    st.plotly_chart(px.bar(dep_prazo, x="dep", y="pct_no_prazo", title="Top departamentos por cumprimento (%)"),
+                                    use_container_width=True)
+                    st.dataframe(dep_prazo)
+                else:
+                    st.info("Sem dados de cumprimento por departamento.")
+            else:
+                st.info("Não foi possível calcular cumprimento por departamento.")
+
+        # 5) Heatmap opcional: mês x departamento (% no prazo)
+        if "dep" in dfg.columns and b["no_prazo"] in dfg.columns:
+            base_col = "competencia" if "competencia" in dfg.columns else ("data_vencimento" if "data_vencimento" in dfg.columns else "data_entrega")
+            if base_col in dfg.columns:
+                tmp = dfg.copy()
+                tmp["mes"] = pd.to_datetime(tmp[base_col], errors="coerce").dt.to_period("M").astype(str)
+                tmp["_np"] = tmp[b["no_prazo"]].astype(float)
+                piv = tmp.pivot_table(index="dep", columns="mes", values="_np", aggfunc="mean")
+                if piv.notna().sum().sum() > 0:
+                    piv = (piv*100).round(1)
+                    st.plotly_chart(px.imshow(piv, aspect="auto", title="% no prazo — Heatmap (mês x departamento)"), use_container_width=True)
 
         # ================= Relatório de Apontamentos =================
         st.markdown("### 📝 Relatório de Apontamentos (automático)")
         apont_textos = []
         if not np.isnan(pct_prazo):
             if pct_prazo >= meta_ok:
-                apont_textos.append(f"✅ Cumprimento global **{pct_prazo:.1f}%** (acima da meta **{meta_ok:.1f}%**).")
+                apont_textos.append(f"✅ Cumprimento global **{pct_prazo:.1f}%** (≥ meta **{meta_ok:.1f}%**).")
             else:
                 apont_textos.append(f"⚠️ Cumprimento global **{pct_prazo:.1f}%** (abaixo da meta **{meta_ok:.1f}%**).")
         if not np.isnan(atraso_med):
@@ -395,12 +434,17 @@ with tabs[1]:
             elif atraso_med > 0:
                 apont_textos.append(f"ℹ️ Atraso médio **{atraso_med:.1f} dias** (controlado).")
         if isinstance(antecip, (int, float)) and antecip > 0:
-            apont_textos.append(f"🏁 **{int(antecip)}** entregas antecipadas — boa eficiência em planejamento.")
+            apont_textos.append(f"🏁 **{int(antecip)}** entregas antecipadas — eficiência em planejamento.")
+        if not np.isnan(pct_sem_pt) and pct_sem_pt > 0:
+            apont_textos.append(f"🛠️ **{pct_sem_pt:.1f}%** das linhas **sem prazo técnico** — rever parametrização.")
+        if not np.isnan(pct_sem_resp) and pct_sem_resp > 0:
+            apont_textos.append(f"👤 **{pct_sem_resp:.1f}%** das linhas **sem responsável** — definir ownership.")
+
         if 'empresa' in dfg.columns and b["atraso"] in dfg.columns:
             atrasadas_cli = dfg[dfg[b["atraso"]].fillna(0) > 0].groupby("empresa").size().reset_index(name="qtd").sort_values("qtd", ascending=False).head(5)
             if not atrasadas_cli.empty:
                 top_cli = atrasadas_cli.iloc[0]
-                apont_textos.append(f"🔍 Maior volume de atrasos no cliente **{top_cli['empresa']}** (**{int(top_cli['qtd'])}** tarefas).")
+                apont_textos.append(f"🔍 Maior volume de atrasos em **{top_cli['empresa']}** (**{int(top_cli['qtd'])}** tarefas).")
 
         if apont_textos:
             for t in apont_textos:
@@ -408,14 +452,16 @@ with tabs[1]:
         else:
             st.write("- Sem apontamentos relevantes com os filtros atuais.")
 
-        # Tabela-resumo de destaques para exportar
         destaques = []
         destaques.append({"indicador": "Cumprimento global", "valor": None if np.isnan(pct_prazo) else round(pct_prazo,1), "meta": meta_ok, "obs": "Base " + basis})
         destaques.append({"indicador": "Atraso médio (dias)", "valor": None if np.isnan(atraso_med) else round(atraso_med,1), "meta": 5, "obs": "Recomendação ≤ 5"})
         destaques.append({"indicador": "Entregas antecipadas (qtd)", "valor": int(antecip) if isinstance(antecip,(int,float)) else 0, "meta": None, "obs": ""})
+        destaques.append({"indicador": "% sem prazo técnico", "valor": None if np.isnan(pct_sem_pt) else round(pct_sem_pt,1), "meta": 0, "obs": "Quanto menor, melhor"})
+        destaques.append({"indicador": "% sem responsável", "valor": None if np.isnan(pct_sem_resp) else round(pct_sem_resp,1), "meta": 0, "obs": "Quanto menor, melhor"})
         df_destaque = pd.DataFrame(destaques)
         st.dataframe(df_destaque)
-        st.download_button("⬇️ Baixar 'Relatório de Apontamentos' (CSV)", df_destaque.to_csv(index=False).encode("utf-8"), "relatorio_apontamentos.csv", "text/csv")
+        st.download_button("⬇️ Baixar 'Relatório de Apontamentos' (CSV)", df_destaque.to_csv(index=False).encode("utf-8"),
+                           "relatorio_apontamentos.csv", "text/csv")
 
 # =============================================================================
 # Aba 3 — Departamentos
